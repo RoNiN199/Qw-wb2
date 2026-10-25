@@ -1,0 +1,308 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create Android project
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WBQR"
+          include(":app")
+          EOF_FILE
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.wbqr"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.wbqr"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("com.google.zxing:core:3.5.3")
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="WB QR"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/wbqr/MainActivity.kt)
+          cat > app/src/main/java/com/example/wbqr/MainActivity.kt <<'EOF_FILE'
+          package com.example.wbqr
+
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.text.InputType
+          import android.util.Base64
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import com.google.zxing.BarcodeFormat
+          import com.google.zxing.EncodeHintType
+          import com.google.zxing.qrcode.QRCodeWriter
+          import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+
+          class MainActivity : Activity() {
+
+              private var current: Bitmap? = null
+              private var currentSk: String = ""
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+                  val scroll = ScrollView(this)
+                  scroll.addView(col)
+
+                  val skInput = EditText(this).apply {
+                      hint = "ШК (11 цифр)"
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                  }
+                  val tailInput = EditText(this).apply {
+                      hint = "Последний байт 0-255 (необязательно)"
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                  }
+                  val makeBtn = Button(this).apply { text = "Создать" }
+                  val saveBtn = Button(this).apply { text = "Сохранить в галерею" }
+                  val info = TextView(this).apply { textSize = 18f }
+                  val image = ImageView(this).apply { adjustViewBounds = true }
+
+                  col.addView(skInput)
+                  col.addView(tailInput)
+                  col.addView(makeBtn)
+                  col.addView(info)
+                  col.addView(
+                      image,
+                      LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT
+                      )
+                  )
+                  col.addView(saveBtn)
+                  setContentView(scroll)
+
+                  makeBtn.setOnClickListener {
+                      val sk = skInput.text.toString().trim()
+                      val n = sk.toLongOrNull()
+                      val tail = if (tailInput.text.isBlank()) 0 else tailInput.text.toString().toIntOrNull()
+                      if (n == null || n < 0 || n >= (1L shl 40) || sk.length > 12) {
+                          toast("Неверный ШК")
+                          return@setOnClickListener
+                      }
+                      if (tail == null || tail !in 0..255) {
+                          toast("Байт должен быть от 0 до 255")
+                          return@setOnClickListener
+                      }
+                      val code = encode(n, tail)
+                      val bmp = sticker(code, sk.padStart(11, '0'))
+                      current = bmp
+                      currentSk = sk
+                      info.text = code
+                      image.setImageBitmap(bmp)
+                  }
+
+                  saveBtn.setOnClickListener {
+                      val bmp = current
+                      if (bmp == null) {
+                          toast("Сначала создайте код")
+                          return@setOnClickListener
+                      }
+                      val values = ContentValues().apply {
+                          put(MediaStore.Images.Media.DISPLAY_NAME, "wb_$currentSk.png")
+                          put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                          put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/WB")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                      if (uri == null) {
+                          toast("Не удалось сохранить")
+                      } else {
+                          contentResolver.openOutputStream(uri)?.use { out ->
+                              bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                          }
+                          toast("Сохранено в Pictures/WB")
+                      }
+                  }
+              }
+
+              private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+
+              // '*' + base64(5 байт числа + 1 байт tail)
+              private fun encode(n: Long, tail: Int): String {
+                  val raw = ByteArray(6)
+                  for (i in 0 until 5) {
+                      raw[i] = ((n shr (8 * (4 - i))) and 0xFF).toByte()
+                  }
+                  raw[5] = tail.toByte()
+                  return "*" + Base64.encodeToString(raw, Base64.NO_WRAP)
+              }
+
+              private fun drawQr(canvas: Canvas, text: String, left: Int, top: Int, size: Int) {
+                  val hints = mapOf(
+                      EncodeHintType.MARGIN to 0,
+                      EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M
+                  )
+                  val m = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, 1, 1, hints)
+                  val n = m.width
+                  val cell = size.toFloat() / n
+                  val paint = Paint().apply { color = Color.BLACK; isAntiAlias = false }
+                  for (y in 0 until n) {
+                      for (x in 0 until n) {
+                          if (m.get(x, y)) {
+                              canvas.drawRect(
+                                  left + Math.round(x * cell).toFloat(),
+                                  top + Math.round(y * cell).toFloat(),
+                                  left + Math.round((x + 1) * cell).toFloat(),
+                                  top + Math.round((y + 1) * cell).toFloat(),
+                                  paint
+                              )
+                          }
+                      }
+                  }
+              }
+
+              private fun drawCentered(canvas: Canvas, text: String, cx: Float, cy: Float, size: Float, face: Typeface, color: Int) {
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      textSize = size
+                      typeface = face
+                      this.color = color
+                      textAlign = Paint.Align.CENTER
+                  }
+                  val fm = p.fontMetrics
+                  canvas.drawText(text, cx, cy - (fm.ascent + fm.descent) / 2f, p)
+              }
+
+              private fun sticker(code: String, sk: String): Bitmap {
+                  val w = 1280
+                  val h = 1560
+                  val margin = 55
+                  val small = 285
+                  val big = 710
+                  val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(bmp)
+                  c.drawColor(Color.WHITE)
+
+                  val top = margin
+                  val bottom = h - margin - small
+                  val left = margin
+                  val right = w - margin - small
+
+                  drawQr(c, code, left, top, small)
+                  drawQr(c, code, right, top, small)
+                  drawQr(c, code, left, bottom, small)
+                  drawQr(c, code, right, bottom, small)
+                  drawQr(c, code, (w - big) / 2, (h - big) / 2 - 10, big)
+
+                  drawCentered(
+                      c, "WB", w / 2f, top + small / 2f, 300f,
+                      Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD), Color.rgb(176, 43, 94)
+                  )
+                  drawCentered(
+                      c, sk.substring(0, 7), w / 2f, bottom + 70f, 120f,
+                      Typeface.MONOSPACE, Color.BLACK
+                  )
+                  drawCentered(
+                      c, sk.substring(7), w / 2f, bottom + 200f, 150f,
+                      Typeface.create(Typeface.MONOSPACE, Typeface.BOLD), Color.BLACK
+                  )
+                  return bmp
+              }
+          }
+          EOF_FILE
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: WB QR build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
